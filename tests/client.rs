@@ -218,6 +218,25 @@ async fn http_errors_carry_the_status() {
 }
 
 #[tokio::test]
+async fn auth_errors_keep_the_api_error_code() {
+    let stub = Stub::start();
+    stub.reply(401, r#"{"error":"invalid_api_key"}"#);
+    match stub.client(KEY).lookup("8.8.8.8", None, None).await {
+        Err(IpWhoError::Api { message, .. }) => assert_eq!(message, "invalid_api_key"),
+        other => panic!("unexpected result: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_json_reply_is_parsed_even_when_another_format_was_asked_for() {
+    // The API ignores `format` on /me and answers in JSON.
+    let stub = Stub::start();
+    let data = stub.client(KEY).me(Some("csv"), None).await.unwrap().data.unwrap();
+    assert_eq!(data.ip, "8.8.8.8");
+    assert_eq!(data.geo_location.unwrap().country.as_deref(), Some("United States"));
+}
+
+#[tokio::test]
 async fn connection_failure_does_not_reveal_the_key() {
     let http = reqwest::Client::builder().no_proxy().build().unwrap();
     let client = IPWhoClient::with_client(KEY, http, Url::parse("http://127.0.0.1:1").unwrap());

@@ -456,7 +456,8 @@ impl IPWhoClient {
         }
 
         // "xml" and "csv" replies aren't JSON: return the raw text in `data.ip`.
-        if raw_format.is_some() {
+        // Go by the reply itself: `/me` ignores `format` and always answers in JSON.
+        if raw_format.is_some() && !text.trim_start().starts_with('{') {
             return Ok(IpGeoResponse {
                 success: true,
                 data: Some(GeoData::from_raw_text(text)),
@@ -482,17 +483,16 @@ impl IPWhoClient {
     }
 
     fn parse_error(&self, status: reqwest::StatusCode, body: &str) -> IpWhoError {
-        if let Ok(err) = serde_json::from_str::<ErrorResponse>(body) {
-            IpWhoError::Api {
-                status,
-                message: err.message.unwrap_or_else(|| "unknown error".into()),
-            }
-        } else {
-            IpWhoError::Api {
-                status,
-                message: body.to_string(),
-            }
-        }
+        let message = match serde_json::from_str::<serde_json::Value>(body) {
+            // Auth errors carry a code in `error` and no `message`.
+            Ok(value) => ["message", "error"]
+                .iter()
+                .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
+                .unwrap_or("unknown error")
+                .to_owned(),
+            Err(_) => body.to_string(),
+        };
+        IpWhoError::Api { status, message }
     }
 }
 
