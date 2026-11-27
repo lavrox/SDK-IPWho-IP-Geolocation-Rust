@@ -219,6 +219,21 @@ pub struct GeoData {
     pub user_agent: Option<UserAgent>,
 }
 
+impl GeoData {
+    fn from_raw_text(text: String) -> Self {
+        Self {
+            ip: text,
+            geo_location: None,
+            timezone: None,
+            flag: None,
+            currency: None,
+            connection: None,
+            security: None,
+            user_agent: None,
+        }
+    }
+}
+
 /// Top-level API response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpGeoResponse {
@@ -243,8 +258,45 @@ pub struct ErrorResponse {
 /// Wraps the `responseArray` from the bulk endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BulkData {
-    #[serde(default, rename = "responseArray")]
+    #[serde(
+        default,
+        rename = "responseArray",
+        deserialize_with = "deserialize_bulk_rows"
+    )]
     pub response_array: Option<Vec<IpGeoResponse>>,
+}
+
+fn deserialize_bulk_rows<'de, D>(deserializer: D) -> Result<Option<Vec<IpGeoResponse>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let rows: Option<Vec<serde_json::Value>> = Option::deserialize(deserializer)?;
+    rows.map(|rows| rows.into_iter().map(bulk_row).collect::<Result<Vec<_>, _>>())
+        .transpose()
+        .map_err(serde::de::Error::custom)
+}
+
+/// Reads one bulk result. The API sends each row flat:
+/// `{success, ip, geoLocation, ...}` or `{success: false, ip, message}`.
+/// A row already nested under `data` is accepted too.
+fn bulk_row(row: serde_json::Value) -> Result<IpGeoResponse, serde_json::Error> {
+    if row.get("data").is_some() {
+        return serde_json::from_value(row);
+    }
+    let success = row
+        .get("success")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let message = row
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let data: GeoData = serde_json::from_value(row)?;
+    Ok(IpGeoResponse {
+        success,
+        data: Some(data),
+        message,
+    })
 }
 
 /// Response from the `/bulk/{bulkIP}` endpoint.
@@ -275,8 +327,18 @@ pub struct IPWhoClient {
 impl IPWhoClient {
     /// Create a new client with the given API key.
     ///
-    /// `api_key` is required by the API as the `apiKey` query parameter.
+    /// `api_key` is sent as `Authorization: Bearer`. Surrounding whitespace is removed.
     pub fn new<S: Into<String>>(api_key: S) -> Result<Self, IpWhoError> {
+        let api_key = api_key.into().trim().to_owned();
+        if api_key.is_empty() {
+            return Err(IpWhoError::Validation("api_key is required".into()));
+        }
+        // The key is sent in a header. Reject it here, without repeating it.
+        if !api_key.chars().all(|c| (' '..='~').contains(&c)) {
+            return Err(IpWhoError::Validation(
+                "api_key contains characters that are not allowed".into(),
+            ));
+        }
         let http = reqwest::Client::builder()
             .user_agent("ipwho-rust-sdk/1.0.0")
             .build()?;
@@ -284,7 +346,7 @@ impl IPWhoClient {
         Ok(Self {
             http,
             base_url,
-            api_key: api_key.into(),
+            api_key,
         })
     }
 
@@ -297,7 +359,7 @@ impl IPWhoClient {
         Self {
             http,
             base_url,
-            api_key: api_key.into(),
+            api_key: api_key.into().trim().to_owned(),
         }
     }
 
@@ -333,6 +395,9 @@ impl IPWhoClient {
     /// Perform a bulk IP lookup.
     ///
     /// - `ips`: Slice of IPv4/IPv6 addresses.
+    ///
+    /// Returns one result per address. Check each row's `success`. A failed row
+    /// has a `message`, and its `data` holds only the `ip`.
     pub async fn bulk(&self, ips: &[&str]) -> Result<BulkResponse, IpWhoError> {
         if ips.is_empty() {
             return Err(IpWhoError::Validation("IP list must not be empty".into()));
@@ -340,11 +405,9 @@ impl IPWhoClient {
         let bulk_param = ips.join(",");
         let path = format!("/bulk/{bulk_param}");
 
-        let mut url = self.base_url.join(&path).map_err(IpWhoError::Url)?;
-        url.query_pairs_mut()
-            .append_pair("apiKey", &self.api_key);
+        let url = self.base_url.join(&path).map_err(IpWhoError::Url)?;
 
-        let resp = self.http.get(url.clone()).send().await?;
+        let resp = self.send(url).await?;
         let status = resp.status();
         let text = resp.text().await?;
 
@@ -371,27 +434,34 @@ impl IPWhoClient {
     ) -> Result<IpGeoResponse, IpWhoError> {
         let mut url = self.base_url.join(path).map_err(IpWhoError::Url)?;
 
-        {
+        let raw_format = format.filter(|f| !f.is_empty() && *f != "json");
+        let fields = fields.filter(|f| !f.is_empty());
+        // Only open the query when there is something to add, to avoid a bare "?".
+        if raw_format.is_some() || fields.is_some() {
             let mut qp = url.query_pairs_mut();
-            qp.append_pair("apiKey", &self.api_key);
-            if let Some(f) = format {
-                if f != "json" {
-                    qp.append_pair("format", f);
-                }
+            if let Some(f) = raw_format {
+                qp.append_pair("format", f);
             }
             if let Some(f) = fields {
-                if !f.is_empty() {
-                    qp.append_pair("get", f);
-                }
+                qp.append_pair("get", f);
             }
         }
 
-        let resp = self.http.get(url.clone()).send().await?;
+        let resp = self.send(url).await?;
         let status = resp.status();
         let text = resp.text().await?;
 
         if !status.is_success() {
             return Err(self.parse_error(status, &text));
+        }
+
+        // "xml" and "csv" replies aren't JSON: return the raw text in `data.ip`.
+        if raw_format.is_some() {
+            return Ok(IpGeoResponse {
+                success: true,
+                data: Some(GeoData::from_raw_text(text)),
+                message: None,
+            });
         }
 
         let parsed: IpGeoResponse = serde_json::from_str(&text)?;
@@ -404,6 +474,11 @@ impl IPWhoClient {
             ));
         }
         Ok(parsed)
+    }
+
+    /// Sends one GET request. The API key goes in a header, not in the URL.
+    async fn send(&self, url: Url) -> Result<reqwest::Response, reqwest::Error> {
+        self.http.get(url).bearer_auth(&self.api_key).send().await
     }
 
     fn parse_error(&self, status: reqwest::StatusCode, body: &str) -> IpWhoError {
@@ -433,12 +508,12 @@ mod tests {
                 "ip": "8.8.8.8",
                 "geoLocation": {
                     "continent": "North America",
-                    "continent_code": "NA",
+                    "continentCode": "NA",
                     "country": "United States",
-                    "country_code": "US",
+                    "countryCode": "US",
                     "capital": "Washington",
                     "region": "California",
-                    "region_code": "CA",
+                    "regionCode": "CA",
                     "city": "Mountain View",
                     "postal_Code": "94043",
                     "dial_code": "1",

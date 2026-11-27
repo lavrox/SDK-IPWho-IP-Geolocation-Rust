@@ -46,6 +46,8 @@ IpGeoResponse
     └── user_agent
 ```
 
+The client sends your API key in the `Authorization` header, so it isn't part of the request URL.
+
 ## Reading the full response (8.8.8.8)
 
 Live [IPWho](https://www.ipwho.org) values: United States, ASN 15169, America/Chicago, dial code +1. Fields are `Option`.
@@ -107,16 +109,24 @@ let me = client.me(None, None).await?;
 println!("{:?}", me.data.as_ref().map(|d| &d.ip));
 
 let bulk = client.bulk(&["8.8.8.8", "1.1.1.1"]).await?;
-println!("{:?}", bulk.data);
+for row in bulk.data.and_then(|d| d.response_array).unwrap_or_default() {
+    let ip = row.data.as_ref().map(|d| d.ip.as_str()).unwrap_or_default();
+    if row.success {
+        let country = row.data.as_ref().and_then(|d| d.geo_location.as_ref()).and_then(|g| g.country.as_deref());
+        println!("{ip} {country:?}");
+    } else {
+        println!("{ip} {:?}", row.message);
+    }
+}
 ```
 
-`format` / `fields` are `Option<&str>` (`json`/`xml`/`csv`; comma-separated filter).
+`format` / `fields` are `Option<&str>` (`json`/`xml`/`csv`; comma-separated filter). For `xml` and `csv`, `data.ip` holds the raw response text.
 
 ## API Reference
 
 ### `IPWhoClient::new(api_key) -> Result<Self, IpWhoError>`
 
-Also `with_client`. Query `apiKey`.
+Also `with_client`. The key is sent as `Authorization: Bearer`.
 
 ### Errors
 
@@ -154,8 +164,10 @@ Serde renames match the live wire (`postal_Code`, `flag_Icon`, `isVpn`, `asn_num
 ## Testing
 
 ```bash
-IPWHO_API_KEY=your_key cargo test
+cargo test
 ```
+
+These tests need no API key: they run against a local stand-in server. For a live check, which uses lookups from your quota:
 
 ```bash
 IPWHO_API_KEY=your_key cargo run --example smoke
